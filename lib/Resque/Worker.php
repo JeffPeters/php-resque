@@ -201,6 +201,7 @@ class Resque_Worker
 				$this->updateProcLine($status);
 				$this->logger->log(Psr\Log\LogLevel::INFO, $status);
 				$this->perform($job);
+				$this->iterablePerform($job);
 				if ($this->child === 0) {
 					exit(0);
 				}
@@ -216,6 +217,12 @@ class Resque_Worker
 				pcntl_wait($status);
 				$exitStatus = pcntl_wexitstatus($status);
 				if($exitStatus !== 0) {
+					//Child may have done more then one job
+					//report failure on last job set by workingOn() in the child
+					$currentJob = $this->job();
+					if (is_array($currentJob['payload'])) {
+						$job->payload = $currentJob['payload'];
+					}
 					$job->fail(new Resque_Job_DirtyExitException(
 						'Job exited with exit code ' . $exitStatus
 					));
@@ -248,6 +255,41 @@ class Resque_Worker
 
 		$job->updateStatus(Resque_Job_Status::STATUS_COMPLETE);
 		$this->logger->log(Psr\Log\LogLevel::NOTICE, '{job} has finished', array('job' => $job));
+	}
+
+	/**
+	 * Process a multple jobs from the same queue.
+	 * Assumes that perform has been called for the first job
+	 *
+	 * @param Resque_Job $currentJob The job to be processed.
+	 */
+	public function iterablePerform(Resque_Job $currentJob){
+		while($nextjob = $this->getNextIterableJob($currentJob)) {
+			$currentJob->payload = $nextjob->payload;
+			$nextjob->worker = $currentJob->worker;
+			$nextjob->worker->workingOn($nextjob);
+			$this->perform($nextjob);
+		}
+	}
+
+	/**
+	 * Find next Job to work on that is the same queue as last Job
+	 * This will allow the same process to excutute another job
+	 *
+	 * @param Resque_Job $currentJob The job to be processed.
+	 */
+	protected function getNextIterableJob(Resque_Job $currentJob) {
+		$nextjob = NULL;
+		if ($currentJob->getInstance() instanceof Resque_Job_Iterable
+				&& $currentJob->getInstance()->shouldPerformAgain()) {
+			$this->logger->log(Psr\Log\LogLevel::INFO, 'Checking {queue} for jobs', array('queue' => $currentJob->queue));
+			$nextjob = Resque_Job::reserve($currentJob->queue);
+			if($nextjob) {
+				$nextjob->worker = $currentJob->worker;
+				$this->logger->log(Psr\Log\LogLevel::INFO, 'Found job on {queue}', array('queue' => $nextjob->queue));
+			}
+		}
+		return $nextjob;
 	}
 
 	/**
