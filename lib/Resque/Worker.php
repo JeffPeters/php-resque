@@ -214,8 +214,13 @@ class Resque_Worker
 				$this->logger->log(Psr\Log\LogLevel::INFO, $status);
 
 				// Wait until the child process finishes before continuing
-				pcntl_wait($status);
+				$this->waitForChild($status);
 				$exitStatus = pcntl_wexitstatus($status);
+				$cleanExit = pcntl_wifexited($status);
+				if (!$cleanExit && $exitStatus === 0) {
+					//child exitStatus would be 0 if kill by a signal
+					$exitStatus = $status;
+				}
 				if($exitStatus !== 0) {
 					//Child may have done more then one job
 					//report failure on last job set by workingOn() in the child
@@ -234,6 +239,55 @@ class Resque_Worker
 		}
 
 		$this->unregisterWorker();
+	}
+
+	/**
+	 * Wait for child job process to finish.
+	 * This will still allow parent to recieve signals
+	 * if we used pcntl_wait it would cause signals to be queued until it returns
+	 *
+	 * @param int $status The pcntl status handle
+	 */
+	public function waitForChild(&$status) {
+		while(1){
+			$siginfo;
+			$signals = array(
+				SIGCHLD,
+				SIGQUIT,
+				SIGTERM,
+				SIGINT,
+				SIGUSR1,
+				SIGUSR2,
+				SIGCONT,
+			);
+			pcntl_sigwaitinfo($signals, $siginfo);
+			switch ($siginfo['signo']) {
+				case SIGCHLD:
+					pcntl_wait($status);
+					$status=$siginfo['status'];
+					break 2;
+				case SIGQUIT:
+					$this->shutdown();
+					break;
+				case SIGTERM:
+				case SIGINT:
+					$this->shutDownNow();
+					break;
+				case SIGUSR1:
+					$this->killChild();
+					break;
+				case SIGUSR2:
+					$this->pauseProcessing();
+					$this->killChild(SIGUSR2);
+					break;
+				case SIGCONT:
+					$this->unPauseProcessing();
+					break;
+				default:
+					break;
+			}
+		}
+		return $status;
 	}
 
 	/**
@@ -281,6 +335,8 @@ class Resque_Worker
 	protected function getNextIterableJob(Resque_Job $currentJob) {
 		$nextjob = NULL;
 		if ($currentJob->getInstance() instanceof Resque_Job_Iterable
+				&& !$this->shutdown
+				&& !$this->paused
 				&& $currentJob->getInstance()->shouldPerformAgain()) {
 			$this->logger->log(Psr\Log\LogLevel::INFO, 'Checking {queue} for jobs', array('queue' => $currentJob->queue));
 			$nextjob = Resque_Job::reserve($currentJob->queue);
@@ -396,6 +452,7 @@ class Resque_Worker
 		pcntl_signal(SIGUSR1, array($this, 'killChild'));
 		pcntl_signal(SIGUSR2, array($this, 'pauseProcessing'));
 		pcntl_signal(SIGCONT, array($this, 'unPauseProcessing'));
+		pcntl_signal(SIGCHLD, array($this, 'childExited'));
 		$this->logger->log(Psr\Log\LogLevel::DEBUG, 'Registered signals');
 	}
 
@@ -419,12 +476,22 @@ class Resque_Worker
 	}
 
 	/**
+	 * Signal handler callback for SIGCHLD
+	 * When a child has died or closed
+	 * Currently a no-op, but here so signal is registered
+	 */
+	public function childExited(){
+		$this->logger->log(Psr\Log\LogLevel::DEBUG, 'SIGCHLD Recieved');
+	}
+	/**
 	 * Schedule a worker for shutdown. Will finish processing the current job
 	 * and when the timeout interval is reached, the worker will shut down.
 	 */
 	public function shutdown()
 	{
 		$this->shutdown = true;
+		//Signal Child to stop processing more IterableJobs
+		$this->killChild(SIGQUIT);
 		$this->logger->log(Psr\Log\LogLevel::NOTICE, 'Shutting down');
 	}
 
@@ -441,19 +508,22 @@ class Resque_Worker
 	/**
 	 * Kill a forked child job immediately. The job it is processing will not
 	 * be completed.
+	 * @param int $signal The Singal to send to child process.
 	 */
-	public function killChild()
+	public function killChild($signal = SIGKILL)
 	{
-		if(!$this->child) {
+		if(!$this->child || $this->child === getmypid()) {
 			$this->logger->log(Psr\Log\LogLevel::DEBUG, 'No child to kill.');
 			return;
 		}
 
-		$this->logger->log(Psr\Log\LogLevel::INFO, 'Killing child at {child}', array('child' => $this->child));
+		$this->logger->log(Psr\Log\LogLevel::INFO, 'Killing child at {child} with signal {signal}', 
+			array('child' => $this->child, 'signal' => $signal));
 		if(exec('ps -o pid,state -p ' . $this->child, $output, $returnCode) && $returnCode != 1) {
-			$this->logger->log(Psr\Log\LogLevel::DEBUG, 'Child {child} found, killing.', array('child' => $this->child));
-			posix_kill($this->child, SIGKILL);
-			$this->child = null;
+			$this->logger->log(Psr\Log\LogLevel::DEBUG, 'Child {child} found, killing with signal {signal}.', 
+				array('child' => $this->child, 'signal' => $signal));
+			posix_kill($this->child, $signal);
+			//Do not null out $this->child, that way we can mark the job as failed
 		}
 		else {
 			$this->logger->log(Psr\Log\LogLevel::INFO, 'Child {child} not found, restarting.', array('child' => $this->child));
