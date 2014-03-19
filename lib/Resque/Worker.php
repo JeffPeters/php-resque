@@ -203,6 +203,7 @@ class Resque_Worker
 				$this->perform($job);
 				$this->iterablePerform($job);
 				if ($this->child === 0) {
+					$this->logger->log(Psr\Log\LogLevel::INFO, 'Finished Job exiting {pid}', array('pid' => getmypid()));
 					exit(0);
 				}
 			}
@@ -260,7 +261,11 @@ class Resque_Worker
 				SIGUSR2,
 				SIGCONT,
 			);
+			$this->logger->log(Psr\Log\LogLevel::DEBUG, "Worker: {pid} Blocking while child PID: {child} runs",
+				array('pid' => getmypid(),'child' => $this->child));
 			pcntl_sigwaitinfo($signals, $siginfo);
+			$this->logger->log(Psr\Log\LogLevel::DEBUG, "Worker: {pid} now unblocked while because of single: {signo}",
+				array('pid' => getmypid(),'signo' => $siginfo['signo']));
 			switch ($siginfo['signo']) {
 				case SIGCHLD:
 					pcntl_wait($status);
@@ -338,11 +343,13 @@ class Resque_Worker
 				&& !$this->shutdown
 				&& !$this->paused
 				&& $currentJob->getInstance()->shouldPerformAgain()) {
-			$this->logger->log(Psr\Log\LogLevel::INFO, 'Checking {queue} for jobs', array('queue' => $currentJob->queue));
+			$this->logger->log(Psr\Log\LogLevel::INFO, 'Iterable Checking {queue} for jobs', array('queue' => $currentJob->queue));
 			$nextjob = Resque_Job::reserve($currentJob->queue);
 			if($nextjob) {
 				$nextjob->worker = $currentJob->worker;
-				$this->logger->log(Psr\Log\LogLevel::INFO, 'Found job on {queue}', array('queue' => $nextjob->queue));
+				$this->logger->log(Psr\Log\LogLevel::INFO, 'Iterable Found job on {queue}', array('queue' => $nextjob->queue));
+			} else {
+				$this->logger->log(Psr\Log\LogLevel::INFO, 'No Iterable Found job on {queue}', array('queue' => $currentJob->queue));
 			}
 		}
 		return $nextjob;
@@ -480,8 +487,10 @@ class Resque_Worker
 	 * When a child has died or closed
 	 * Currently a no-op, but here so signal is registered
 	 */
-	public function childExited(){
-		$this->logger->log(Psr\Log\LogLevel::DEBUG, 'SIGCHLD Recieved');
+	public function childExited($signo){
+		pcntl_wait($status, WNOHANG);
+		$this->logger->log(Psr\Log\LogLevel::DEBUG, "SIGCHLD Recieved in {pid} for child PID: {child}",
+			array('pid' => getmypid(),'child' => $status));
 	}
 	/**
 	 * Schedule a worker for shutdown. Will finish processing the current job
